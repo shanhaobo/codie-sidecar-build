@@ -18,6 +18,20 @@
 
 > `codie_host` sidecar 是 **PyInstaller 二进制**、随 Bridge 打包,**不是容器镜像**,不在此流水线。
 
+### 第三方现成镜像(mirror,非 codie 源码)
+
+有些 MCP sidecar 是**外部现成镜像**(非 codie 自有源码,自己 build 是重复造轮子)。
+这类只做 **registry 间镜像搬运**——把上游镜像多架构整体复制到 ghcr,**不 build**——
+让 Docker 守护进程连不上 Docker Hub 的机器(如 CN 网络:`registry-1.docker.io` 超时但
+`ghcr.io` 可达)也能从 ghcr 拉到。走独立的 `mirror-thirdparty-images.yml`,与上面
+build 自有源码的流水线正交。
+
+| ghcr 镜像 | 上游 | sidecar | 运行参数(Bridge 自定义 sidecar 表单) |
+|---|---|---|---|
+| `firecrawl-mcp` | `mcp/firecrawl:latest`(Docker Hub) | firecrawl | port `3000` · path `/mcp` · env `HTTP_STREAMABLE_SERVER=true` + `FIRECRAWL_API_KEY`(密钥) |
+
+加一个第三方镜像:在 `mirror-thirdparty-images.yml` 的 matrix 里加一行 `{ src, dest }`。
+
 ## 目录
 
 ```

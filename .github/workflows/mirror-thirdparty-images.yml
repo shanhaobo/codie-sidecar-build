@@ -1,0 +1,66 @@
+name: mirror-thirdparty-images
+
+# Mirrors THIRD-PARTY, ready-made MCP images (not codie-owned source) into
+# ghcr.io/<owner>/<dest>, so Bridge can pull them from ghcr even on hosts whose
+# Docker daemon cannot reach Docker Hub (e.g. CN networks where registry-1.
+# docker.io times out but ghcr.io is reachable).
+#
+# Unlike build-sidecar-images.yml — which BUILDS codie's own self-contained
+# sidecar sources — this workflow does NOT build anything. It uses
+# `docker buildx imagetools create` to copy the source image's full manifest
+# list (all architectures) verbatim from its upstream registry to ghcr. No
+# QEMU, no Dockerfile: the bytes are copied between registries, the runner only
+# relays layers.
+#
+# Add a third-party image by appending one row to the matrix below. `src` is the
+# upstream ref (pulled by the runner, which CAN reach Docker Hub); `dest` is the
+# ghcr repo name under this owner.
+#
+# Runtime params live with the consumer (Bridge "自定义 sidecar" form), not here:
+#   firecrawl → containerPort 3000, mcpPath /mcp,
+#               env HTTP_STREAMABLE_SERVER=true + FIRECRAWL_API_KEY=<secret>
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["thirdparty-v*"]
+
+permissions:
+  contents: read
+  packages: write   # push to ghcr.io with the built-in GITHUB_TOKEN
+
+jobs:
+  mirror:
+    name: mirror (${{ matrix.src }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { src: "mcp/firecrawl:latest", dest: "firecrawl-mcp" }
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror ${{ matrix.src }} -> ghcr (all source arches)
+        env:
+          SRC: ${{ matrix.src }}
+          DEST: ghcr.io/${{ github.repository_owner }}/${{ matrix.dest }}
+        run: |
+          set -euo pipefail
+          DEST="$(echo "$DEST" | tr '[:upper:]' '[:lower:]')"
+          TS_TAG="$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          echo "Mirroring ${SRC} → ${DEST}:latest (+ ${TS_TAG}), copying all source arches"
+          docker buildx imagetools create \
+            -t "${DEST}:latest" \
+            -t "${DEST}:${TS_TAG}" \
+            "${SRC}"
+          echo "── manifest ──"
+          docker buildx imagetools inspect "${DEST}:latest"
