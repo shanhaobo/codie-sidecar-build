@@ -1,0 +1,141 @@
+name: build-sidecar-images
+
+# Builds the codie MCP sidecar container images (media / browser / search /
+# memory / home) and pushes multi-arch images to ghcr.io. Independent from
+# build-agent-images.yml — separate trigger, separate matrix.
+#
+# Unlike the agent images, sidecars are NOT fork wrappers: their full build
+# context (Dockerfile + server.py + pyproject) lives in THIS repo under
+# docker-registry/sidecars/<name>/. So there is no fork checkout step.
+#
+# Same native-runner + push-by-digest + manifest-merge pattern as the agents
+# (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm, no QEMU). ACR / TCR
+# mirroring is added later (see the agent workflow's merge-step comment).
+#
+# NOTE: codie_host is a PyInstaller binary shipped inside the Bridge, NOT a
+# container image — it is intentionally absent here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Informational only — each arch builds on its native runner via the matrix below."
+        default: "linux/amd64,linux/arm64"
+        required: false
+  push:
+    tags: ["sidecar-v*"]
+
+permissions:
+  contents: read
+  packages: write   # push to ghcr.io with the built-in GITHUB_TOKEN
+
+jobs:
+  # ── Stage 1: per-arch native build, pushed BY DIGEST (no tag) ──────────────
+  build:
+    name: build (${{ matrix.image }} · ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: codie-media-mcp,   script: build-media-mcp-docker.sh,   arch: amd64, platform: linux/amd64, runner: ubuntu-latest }
+          - { image: codie-media-mcp,   script: build-media-mcp-docker.sh,   arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { image: codie-browser-mcp, script: build-browser-mcp-docker.sh, arch: amd64, platform: linux/amd64, runner: ubuntu-latest }
+          - { image: codie-browser-mcp, script: build-browser-mcp-docker.sh, arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { image: codie-search-mcp,  script: build-search-mcp-docker.sh,  arch: amd64, platform: linux/amd64, runner: ubuntu-latest }
+          - { image: codie-search-mcp,  script: build-search-mcp-docker.sh,  arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { image: codie-memory-mcp,  script: build-memory-mcp-docker.sh,  arch: amd64, platform: linux/amd64, runner: ubuntu-latest }
+          - { image: codie-memory-mcp,  script: build-memory-mcp-docker.sh,  arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { image: codie-home-mcp,    script: build-home-mcp-docker.sh,    arch: amd64, platform: linux/amd64, runner: ubuntu-latest }
+          - { image: codie-home-mcp,    script: build-home-mcp-docker.sh,    arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: Checkout build repo (sidecar contexts live here)
+        uses: actions/checkout@v6
+
+      # No QEMU: this runner is already the target architecture.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push ${{ matrix.image }} (${{ matrix.arch }}, by digest)
+        env:
+          REGISTRIES: ghcr.io/${{ github.repository_owner }}
+          PLATFORMS: ${{ matrix.platform }}
+          BUILD_MODE: digest
+          METADATA_FILE: ${{ runner.temp }}/metadata-${{ matrix.image }}-${{ matrix.arch }}.json
+        run: |
+          set -euo pipefail
+          echo "Building ${{ matrix.image }} for ${PLATFORMS} natively on $(uname -m) → ${REGISTRIES} (by digest)"
+          bash docker-registry/scripts/${{ matrix.script }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          meta="${{ runner.temp }}/metadata-${{ matrix.image }}-${{ matrix.arch }}.json"
+          digest=$(jq -r '.["containerimage.digest"]' "$meta")
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "error: no containerimage.digest in $meta" >&2
+            cat "$meta" >&2 || true
+            exit 1
+          fi
+          echo "Pushed digest: $digest"
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Stage 2: assemble the multi-arch manifest list + apply tags ────────────
+  merge:
+    name: merge (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [codie-media-mcp, codie-browser-mcp, codie-search-mcp, codie-memory-mcp, codie-home-mcp]
+    steps:
+      - name: Download per-arch digests for this image
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          IMAGE="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          TS_TAG="$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          count=$(ls -1 | wc -l)
+          echo "Merging ${count} arch digest(s) → ${IMAGE}:latest, ${IMAGE}:${TS_TAG}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${TS_TAG}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          echo "── manifest ──"
+          docker buildx imagetools inspect "${IMAGE}:latest"

@@ -1,0 +1,17 @@
+[project]
+name = "codie-media-mcp"
+version = "0.1.0"
+description = "Per-instance media/document toolchain exposed via MCP over HTTP."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+    "starlette>=0.37",
+    "uvicorn[standard]>=0.30",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
