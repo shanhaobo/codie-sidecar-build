@@ -1,3 +1,12 @@
+# ===== 白名单：默认忽略本目录全部内容，只放行下面列出的条目 =====
+# 新增一级目录/文件时必须在这里加一条 `!` 规则，否则会被静默忽略（git status 里也看不到）。
+/*
+!/.github/
+!/.gitignore
+!/README.md
+!/docker-registry/
+
+# ===== 以下为原黑名单，作用于上面放行的目录内部 =====
 # Build / dependency artifacts
 node_modules/
 .venv/
